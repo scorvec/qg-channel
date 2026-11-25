@@ -1,0 +1,101 @@
+name: analysis-bias
+
+# The IFS and GFS analyses minus ERA5 (observations/analysis_bias.py; ECMWF open data from Google Cloud, GFS from NOAA's
+# AWS bucket, ERA5 from the ARCO copy on Google Cloud), window means per source and hour, and ERA5 verification fields.
+# One job per block of days; results: this repository's release analysis-bias-v1.
+on:
+  workflow_dispatch:
+    inputs:
+      first:
+        description: "first day, YYYY-MM-DD"
+        required: true
+      last:
+        description: "last day (ERA5 verification to here), YYYY-MM-DD"
+        required: true
+      bias_end:
+        description: "last day of analysis differences, YYYY-MM-DD"
+        required: true
+      windows:
+        description: "difference windows, a:b,c:d"
+        required: true
+      block:
+        description: "days per job"
+        default: "4"
+
+jobs:
+  list:
+    runs-on: ubuntu-latest
+    outputs:
+      blocks: ${{ steps.b.outputs.blocks }}
+    steps:
+      - id: b
+        env:
+          FIRST: ${{ inputs.first }}
+          LAST: ${{ inputs.last }}
+          BLOCK: ${{ inputs.block }}
+        run: |
+          d="$FIRST"; out=()
+          while [[ ! "$d" > "$LAST" ]]; do
+            e=$(date -u -d "$d + $((BLOCK - 1)) day" +%Y-%m-%d); [[ "$e" > "$LAST" ]] && e="$LAST"
+            out+=("$d:$e"); d=$(date -u -d "$e + 1 day" +%Y-%m-%d)
+          done
+          list=$(printf '%s\n' "${out[@]}" | jq -R . | jq -sc .)
+          echo "blocks=$list" >> "$GITHUB_OUTPUT"; echo "$list"
+
+  days:
+    needs: list
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix:
+        block: ${{ fromJson(needs.list.outputs.blocks) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -e ".[wcb]" eccodes
+      - name: Differences and verification fields
+        env:
+          BLOCK: ${{ matrix.block }}
+          BIAS_END: ${{ inputs.bias_end }}
+        run: |
+          set -o pipefail
+          a=${BLOCK%%:*}; b=${BLOCK##*:}
+          python -u -X faulthandler observations/analysis_bias.py days --start "$a" --end "$b" --bias-end "$BIAS_END" \
+            --out "days_${a}.npz" 2>&1 | tee "days_${a}.log"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: days-${{ strategy.job-index }}
+          path: days_*
+          retention-days: 7
+
+  combine:
+    needs: days
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -e ".[wcb]" eccodes
+      - uses: actions/download-artifact@v4
+        with:
+          path: parts
+          merge-multiple: true
+      - name: Window means and release analysis-bias-v1
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WINDOWS: ${{ inputs.windows }}
+        run: |
+          set -o pipefail
+          python -u observations/analysis_bias.py combine --windows "$WINDOWS" --out analysis_bias.npz parts/days_*.npz
+          gh release view analysis-bias-v1 -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
+            gh release create analysis-bias-v1 -R "$GITHUB_REPOSITORY" --title analysis-bias-v1 \
+              --notes "IFS and GFS analyses minus ERA5 (ECMWF open data CC BY 4.0; NOAA GFS; Copernicus ERA5); observations/analysis_bias.py."
+          gh release upload analysis-bias-v1 -R "$GITHUB_REPOSITORY" analysis_bias.npz --clobber
