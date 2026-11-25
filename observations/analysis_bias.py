@@ -144,8 +144,9 @@ def combine(a) -> dict:
         out[k] = np.concatenate([p[k] for p in parts])[o]
     windows = [w.split(":") for w in a.windows.split(",")]
     out["windows"] = np.array([[np.datetime64(x, "s") for x in w] for w in windows])
-    for k in [k for k in parts[0] if k.startswith(("ifs_", "gfs_"))]:
-        x = np.concatenate([p[k] for p in parts])
+    keys = sorted({k for p in parts for k in p if k.startswith(("ifs_", "gfs_"))})
+    for k in keys:
+        x = np.concatenate([p[k] for p in parts if k in p])  # days after --bias-end carry verification fields only
         means = []
         for w0, w1 in windows:
             m = (bd >= np.datetime64(w0)) & (bd <= np.datetime64(w1))
