@@ -106,11 +106,16 @@ def read(run, step, stream, kind, need, number=None, pool=None, model="ifs") -> 
     height (AIFS-ENS) give gh from z."""
     rows = index(run, step, stream, kind, model)
     if "gh" in need and not any(r["param"] == "gh" for r in rows):
-        out = read(
-            run, step, stream, kind, {("z" if k == "gh" else k): v for k, v in need.items()}, number, pool, model
-        )
-        levs, z = out.pop("z")
-        return {**out, "gh": (levs, z / G)}
+        nz = {k: v for k, v in need.items() if k != "gh"}
+        nz["z"] = tuple(sorted(set(need["gh"]) | set(need.get("z", ()))))
+        out = read(run, step, stream, kind, nz, number, pool, model)
+        levs, z = out["z"]
+        if "z" in need:
+            out["z"] = (sorted(need["z"]), z[[levs.index(lev) for lev in sorted(need["z"])]])
+        else:
+            del out["z"]
+        gh = sorted(need["gh"])
+        return {**out, "gh": (gh, z[[levs.index(lev) for lev in gh]] / G)}
     rows = want(rows, need, number)
     u = url(run, step, stream, kind, model) + ".grib2"
     bufs = list(pool.map(lambda r: get(u, (r["_offset"], r["_length"])), rows))
