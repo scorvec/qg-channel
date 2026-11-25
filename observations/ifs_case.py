@@ -165,7 +165,7 @@ def members(a, E) -> dict:
         for step in steps:
             t0 = time.time()
             nd = dict(need) if step else {k: v for k, v in need.items() if k != "tp"}
-            raw = read(run, step, "enfo", "pf", nd, number=str(n), pool=pool)
+            raw = read(run, step, "enfo", "ef", nd, number=str(n), pool=pool)
             x = extras(raw, E)
             fp = {
                 k: {
