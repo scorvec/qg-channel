@@ -1,0 +1,124 @@
+name: ifs-region
+
+# Earlier IFS-ENS cycles and the verifying IFS analyses over the Canadian Arctic, Baffin Bay and Greenland (ECMWF open
+# data, Google Cloud copy only; observations/ifs_case.py region / region-analyses): every level, the surface state, cloud,
+# snow and sea ice, daily to 10 days. One job per cycle and half of the members; results: release ifs-region-v1.
+on:
+  workflow_dispatch:
+    inputs:
+      first:
+        description: "first cycle, YYYY-MM-DD (00 UTC)"
+        required: true
+      last:
+        description: "last cycle, YYYY-MM-DD"
+        required: true
+      every:
+        description: "days between cycles"
+        default: "2"
+      analyses_end:
+        description: "last verifying analysis, YYYY-MM-DD"
+        required: true
+
+jobs:
+  list:
+    runs-on: ubuntu-latest
+    outputs:
+      runs: ${{ steps.r.outputs.runs }}
+    steps:
+      - id: r
+        env:
+          FIRST: ${{ inputs.first }}
+          LAST: ${{ inputs.last }}
+          EVERY: ${{ inputs.every }}
+        run: |
+          d="$FIRST"; out=()
+          while [[ ! "$d" > "$LAST" ]]; do out+=("${d}T00"); d=$(date -u -d "$d + $EVERY day" +%Y-%m-%d); done
+          list=$(printf '%s\n' "${out[@]}" | jq -R . | jq -sc .)
+          echo "runs=$list" >> "$GITHUB_OUTPUT"; echo "$list"
+
+  cycle:
+    needs: list
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix:
+        run: ${{ fromJson(needs.list.outputs.runs) }}
+        half: ["1-25", "26-50"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: scorvec/scorvec.github.io
+          path: site
+          sparse-checkout: scripts/wcb
+          sparse-checkout-cone-mode: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -e ".[wcb]" eccodes
+      - name: Members
+        env:
+          RUN: ${{ matrix.run }}
+          HALF: ${{ matrix.half }}
+        run: |
+          set -o pipefail
+          tag="$(echo "$RUN" | tr -d 'T:-')_${HALF}"
+          python -u -X faulthandler observations/ifs_case.py region --runs "$RUN" --members "$HALF" --last-step 240 \
+            --elias site/scripts/wcb --out "rg_${tag}.npz" 2>&1 | tee "rg_${tag}.log"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: rg-${{ strategy.job-index }}
+          path: rg_*
+
+  analyses:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: scorvec/scorvec.github.io
+          path: site
+          sparse-checkout: scripts/wcb
+          sparse-checkout-cone-mode: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -e ".[wcb]" eccodes
+      - name: Analyses
+        env:
+          START: ${{ inputs.first }}
+          END: ${{ inputs.analyses_end }}
+        run: |
+          set -o pipefail
+          python -u observations/ifs_case.py region-analyses --start "$START" --end "$END" --elias site/scripts/wcb \
+            --out region_analyses.npz 2>&1 | tee region_analyses.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: analyses
+          path: region_analyses.*
+
+  publish:
+    needs: [cycle, analyses]
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: out
+          merge-multiple: true
+      - name: Release ifs-region-v1
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! ls out/*.npz >/dev/null 2>&1; then echo "::warning::nothing finished"; exit 0; fi
+          gh release view ifs-region-v1 -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
+            gh release create ifs-region-v1 -R "$GITHUB_REPOSITORY" --title ifs-region-v1 \
+              --notes "ECMWF open data (CC BY 4.0): IFS-ENS cycles and IFS analyses over the Canadian Arctic and Greenland; observations/ifs_case.py."
+          gh release upload ifs-region-v1 -R "$GITHUB_REPOSITORY" out/*.npz --clobber

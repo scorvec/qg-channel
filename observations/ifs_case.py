@@ -317,9 +317,117 @@ def analyses(a, E) -> dict:
     return dict(days=days.values.astype("datetime64[s]"), **coarse_coords(), **{k: np.stack(v) for k, v in res.items()})
 
 
+# region mode: the Canadian Arctic, Baffin Bay and Greenland on 2 degrees (8 x 8 means of 0.25 degree, 85-45N,
+# 130W-10E), every level and the surface state, ensemble mean and spread, plus every member's means over BOXES
+REGION_PL = ("t", "q", "u", "v", "gh")
+REGION_SFC = ("2t", "skt", "msl", "tcc", "lcc", "sd", "sithick", "tcwv", "sp")
+REGION_ACC = ("tp", "str", "ssr", "ttr")  # accumulated: members only (zero in the analyses)
+BOXES = {"canarctic": ((60.0, 72.0), (265.0, 295.0)), "baffin": ((65.0, 78.0), (285.0, 310.0))}
+R0, R1, C0, NC = 20, 180, 920, 560  # rows 85N..45N, columns 230E..370E (wraps)
+
+
+def region_grid(x: np.ndarray) -> np.ndarray:
+    """(..., 721, 1440) from 90N and 0E -> (..., 20, 70) 2 degree means over 85-45N, 230-370E."""
+    cols = (C0 + np.arange(NC)) % 1440
+    y = x[..., R0:R1, :][..., cols]
+    return y.reshape(*y.shape[:-2], 20, 8, 70, 8).mean((-3, -1))
+
+
+def region_boxes(g: np.ndarray) -> dict:
+    lat = 84.125 - 2.0 * np.arange(20)
+    lon = 230.875 + 2.0 * np.arange(70)
+    out = {}
+    for k, (la, lo) in BOXES.items():
+        m = ((lat >= la[0]) & (lat <= la[1]))[:, None] & ((lon >= lo[0]) & (lon <= lo[1]))[None, :]
+        w = np.cos(np.deg2rad(lat))[:, None] * m
+        out[k] = (g * w).sum((-2, -1)) / w.sum()
+    return out
+
+
+def region_state(raw: dict, acc: bool) -> dict:
+    out = {}
+    for k in REGION_PL:
+        out[k] = region_grid(raw[k][1].astype(np.float64))
+    for k in REGION_SFC + (REGION_ACC if acc else ()):
+        out[k] = region_grid(raw[k][1][0].astype(np.float64)) if k in raw else np.zeros((20, 70))
+    return out
+
+
+def region(a, E) -> dict:
+    """Members of --runs, daily steps to --last-step: ensemble mean and standard deviation on the region grid, and
+    every member's BOXES means."""
+    runs = [pd.Timestamp(r) for r in a.runs.split(",")]
+    lo, hi = (int(x) for x in a.members.split("-"))
+    nums = list(range(lo, hi + 1))
+    steps = list(range(0, a.last_step + 1, 24))
+    pool = ThreadPoolExecutor(16)
+    keys = REGION_PL + REGION_SFC + REGION_ACC
+    res: dict[str, list] = {}
+    for run in runs:
+        s1 = {k: np.zeros((len(steps), 14, 20, 70) if k in REGION_PL else (len(steps), 20, 70)) for k in keys}
+        s2 = {k: np.zeros_like(v) for k, v in s1.items()}
+        bx = {
+            f"{b}_{k}": np.zeros((len(nums), len(steps)) + ((14,) if k in REGION_PL else ()))
+            for b in BOXES
+            for k in keys
+        }
+        for i, n in enumerate(nums):
+            t0 = time.time()
+            for j, step in enumerate(steps):
+                need = dict.fromkeys(REGION_PL, LEVELS) | dict.fromkeys(REGION_SFC, ())
+                if step:
+                    need |= dict.fromkeys(REGION_ACC, ())
+                x = region_state(read(run, step, "enfo", "ef", need, number=str(n), pool=pool), acc=step > 0)
+                for k in keys:
+                    v = x.get(k, np.zeros((20, 70)))
+                    s1[k][j] += v
+                    s2[k][j] += v * v
+                    for b, m in region_boxes(v).items():
+                        bx[f"{b}_{k}"][i, j] = m
+            print(f"  {run:%Y-%m-%d %H}Z member {n}: {len(steps)} steps in {time.time() - t0:.0f} s", flush=True)
+        n_ = len(nums)
+        for k in keys:
+            mean = s1[k] / n_
+            res.setdefault(f"mean_{k}", []).append(mean.astype(np.float32))
+            res.setdefault(f"sd_{k}", []).append(np.sqrt(np.maximum(s2[k] / n_ - mean**2, 0)).astype(np.float32))
+        for k, v in bx.items():
+            res.setdefault(f"box_{k}", []).append(v.astype(np.float32))
+    return dict(
+        runs=np.array([np.datetime64(r, "s") for r in runs]),
+        numbers=np.array(nums),
+        steps=np.array(steps),
+        levels=np.array(LEVELS),
+        rlat=84.125 - 2.0 * np.arange(20),
+        rlon=230.875 + 2.0 * np.arange(70),
+        **{k: np.stack(v) for k, v in res.items()},
+    )
+
+
+def region_analyses(a, E) -> dict:
+    """The 00 UTC analyses from --start to --end on the region grid, with the BOXES means."""
+    days = pd.date_range(a.start, a.end, freq="1D")
+    pool = ThreadPoolExecutor(16)
+    need = dict.fromkeys(REGION_PL, LEVELS) | dict.fromkeys(REGION_SFC, ())
+    res: dict[str, list] = {}
+    for d in days:
+        x = region_state(read(d, 0, "oper", "fc", need, pool=pool), acc=False)
+        for k, v in x.items():
+            res.setdefault(k, []).append(v.astype(np.float32))
+            for b, m in region_boxes(v).items():
+                res.setdefault(f"box_{b}_{k}", []).append(np.float32(m) if np.ndim(m) == 0 else m.astype(np.float32))
+        print(f"  analysis {d:%Y-%m-%d}", flush=True)
+    return dict(
+        days=days.values.astype("datetime64[s]"),
+        levels=np.array(LEVELS),
+        rlat=84.125 - 2.0 * np.arange(20),
+        rlon=230.875 + 2.0 * np.arange(70),
+        **{k: np.stack(v) for k, v in res.items()},
+    )
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=("control", "members", "hindcast", "analyses"))
+    ap.add_argument("mode", choices=("control", "members", "hindcast", "analyses", "region", "region-analyses"))
     ap.add_argument("--run", default="")
     ap.add_argument("--model", choices=tuple(MODELS), default="ifs")
     ap.add_argument("--start")
@@ -334,7 +442,14 @@ def main() -> int:
     sys.path.insert(0, a.elias)
     import elias as E
 
-    out = {"control": control, "members": members, "hindcast": hindcast, "analyses": analyses}[a.mode](a, E)
+    out = {
+        "control": control,
+        "members": members,
+        "hindcast": hindcast,
+        "analyses": analyses,
+        "region": region,
+        "region-analyses": region_analyses,
+    }[a.mode](a, E)
     np.savez_compressed(a.out, **out)
     print("wrote", a.out, {k: getattr(v, "shape", None) for k, v in out.items()})
     return 0
