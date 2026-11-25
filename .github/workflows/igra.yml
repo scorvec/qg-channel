@@ -1,0 +1,48 @@
+name: igra-arctic
+
+# Arctic radiosondes from NOAA/NCEI IGRA v2 -> one parquet file of lower-stratosphere and tropopause quantities per
+# sounding, published as a release asset. Run by hand; the archive changes slowly.
+on:
+  workflow_dispatch:
+    inputs:
+      min_lat:
+        description: "southernmost station latitude"
+        default: "60"
+      tag:
+        description: "release tag"
+        default: "igra-arctic-v1"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: igra
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -e ".[observations]"
+      - name: Read the soundings
+        run: |
+          set -o pipefail
+          mkdir -p igra
+          python observations/igra_arctic.py --min-lat "${{ inputs.min_lat }}" --out igra | tee igra/log.txt || exit 1
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" igra/igra_arctic.parquet igra/stations.csv igra/log.txt --clobber
+          else
+            gh release create "$TAG" igra/igra_arctic.parquet igra/stations.csv igra/log.txt \
+              --title "Arctic radiosondes (IGRA v2)" \
+              --notes "Lower-stratosphere temperature and wind, WMO tropopause and tropopause-inversion strength for every 00/12 UTC October-April sounding at long-record stations north of ${{ inputs.min_lat }}N. Source: NOAA/NCEI Integrated Global Radiosonde Archive v2. Built by observations/igra_arctic.py."
+          fi
