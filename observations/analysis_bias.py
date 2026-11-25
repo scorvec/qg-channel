@@ -167,7 +167,7 @@ def main() -> int:
     ap.add_argument("--windows", default="")
     ap.add_argument("--out", required=True)
     ap.add_argument("files", nargs="*")
-    a = ap.parse_args()
+    a = ap.parse_intermixed_args()
     out = days(a) if a.mode == "days" else combine(a)
     np.savez_compressed(a.out, **out)
     print("wrote", a.out, {k: v.shape for k, v in out.items()})
