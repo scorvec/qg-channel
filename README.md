@@ -88,6 +88,11 @@ lower-stratosphere temperatures and winds, the WMO tropopause, and the strength 
 model's mechanism runs through the tropopause PV gradient, so the sharpness of the observed tropopause after sudden
 warmings is the direct test.
 
+`observations/era5_wcb.py` (the `era5-wcb` workflow, one job per event, release `era5-wcb-v1`) finds warm conveyor belts
+around each sudden warming: ERA5 from the public analysis-ready copy on Google Cloud, read at 00 and 12 UTC, through the
+ELIAS 2.0 networks of Quinting and Grams (2022). The model is dry; this asks whether the low-PV outflow of moist
+ascent, landing on the weakened high-latitude PV gradient after a warming, helps decide where the waves break.
+
 ## Licence
 
 MIT.

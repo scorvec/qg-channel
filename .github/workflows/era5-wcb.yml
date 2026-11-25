@@ -1,0 +1,106 @@
+name: era5-wcb
+
+# Warm conveyor belts around each sudden stratospheric warming: ERA5 (public ARCO copy on Google Cloud, read
+# anonymously) through the ELIAS 2.0 networks (observations/era5_wcb.py). The networks' code is elias.py from
+# scorvec/scorvec.github.io and the published archive (models, thresholds, trajectory climatology) is that repository's
+# release wcb-ref-v1. One job per event; the results go to this repository's release era5-wcb-v1.
+on:
+  workflow_dispatch:
+    inputs:
+      dates:
+        description: "event dates (YYYY-MM-DD, space separated); empty = every event in observations/ssw_dates.csv"
+        default: ""
+
+permissions:
+  contents: write
+
+concurrency:
+  group: era5-wcb
+  cancel-in-progress: false
+
+jobs:
+  list:
+    runs-on: ubuntu-latest
+    outputs:
+      dates: ${{ steps.d.outputs.dates }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: d
+        env:
+          DATES: ${{ inputs.dates }}
+        run: |
+          if [ -n "$DATES" ]; then
+            list=$(printf '%s\n' $DATES | jq -R . | jq -sc .)
+          else
+            list=$(tail -n +2 observations/ssw_dates.csv | cut -d, -f1 | jq -R . | jq -sc .)
+          fi
+          echo "dates=$list" >> "$GITHUB_OUTPUT"
+          echo "$list"
+
+  event:
+    needs: list
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      max-parallel: 8
+      matrix:
+        date: ${{ fromJson(needs.list.outputs.dates) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: scorvec/scorvec.github.io
+          path: site
+          sparse-checkout: scripts/wcb
+          sparse-checkout-cone-mode: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -e ".[wcb]"
+      - uses: actions/cache@v4
+        id: arch
+        with:
+          path: wcbmetric_v2.zip
+          key: wcb-ref-v1-dbea2b2f3d836fb3190b3ca2b2e0c0bc
+      - name: The networks, thresholds and climatology (scorvec.github.io release wcb-ref-v1)
+        if: steps.arch.outputs.cache-hit != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release download wcb-ref-v1 -R scorvec/scorvec.github.io -p wcbmetric_v2.zip
+      - name: Identify
+        env:
+          DATE: ${{ matrix.date }}
+        run: |
+          set -o pipefail
+          echo "dbea2b2f3d836fb3190b3ca2b2e0c0bc  wcbmetric_v2.zip" | md5sum -c -
+          mkdir archive && unzip -q wcbmetric_v2.zip -d archive
+          root=$(dirname "$(find archive -name calc_wcbmetric_v2.py | head -1)")
+          tag=$(echo "$DATE" | tr -d -)
+          python -u observations/era5_wcb.py --date "$DATE" --elias site/scripts/wcb --archive "$root" \
+            --out "wcb_${tag}.npz" 2>&1 | tee "wcb_${tag}.log"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wcb-${{ matrix.date }}
+          path: wcb_*
+          retention-days: 30
+
+  publish:
+    needs: event
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wcb-*
+          merge-multiple: true
+          path: out
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ls out
+          gh release view era5-wcb-v1 >/dev/null 2>&1 || gh release create era5-wcb-v1 \
+            --title "ERA5 warm conveyor belts around SSWs" \
+            --notes "ELIAS 2.0 (Quinting and Grams 2022) on ERA5 at 00/12 UTC, event days -10 to +45; observations/era5_wcb.py."
+          gh release upload era5-wcb-v1 out/*.npz out/*.log --clobber
