@@ -36,11 +36,14 @@ MONTHS = {10, 11, 12, 1, 2, 3, 4}
 
 def stations(min_lat: float, first: int, last: int) -> pd.DataFrame:
     txt = requests.get(LIST, headers=HEADERS, timeout=60).text
-    rows = [
-        (ln[0:11], float(ln[12:20]), float(ln[21:30]), ln[41:71].strip(), int(ln[72:76]), int(ln[77:81]))
-        for ln in txt.splitlines()
-        if len(ln) >= 81
-    ]
+    rows = []
+    for ln in txt.splitlines():
+        try:  # a few entries have no coordinates
+            rows.append(
+                (ln[0:11], float(ln[12:20]), float(ln[21:30]), ln[41:71].strip(), int(ln[72:76]), int(ln[77:81]))
+            )
+        except ValueError:
+            continue
     st = pd.DataFrame(rows, columns=["id", "lat", "lon", "name", "first", "last"])
     return st[(st.lat >= min_lat) & (st["first"] <= first) & (st["last"] >= last)].reset_index(drop=True)
 
