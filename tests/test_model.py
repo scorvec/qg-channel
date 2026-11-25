@@ -62,3 +62,18 @@ def test_imposed_run_is_finite_and_paired():
     exp = qg.imposed(c, q0, clim, qg.polar_anomaly(m, "low"), days=3, log=lambda _: None)
     assert np.isfinite(exp["u"]).all()
     assert not np.allclose(exp["u"], ref["u"])
+
+
+def test_mountain_forces_anticyclone_on_windward_side():
+    """Flow over a mountain: with q = 0 and westerlies at the ground, the lowest layer's PV falls on the windward (west)
+    slope and rises on the lee slope; the mountain changes the tendency of the lowest layer only."""
+    flat = qg.build(qg.Config(mountains=()))
+    assert flat.qtopo_x is None
+    m = qg.build(qg.Config(mountains=("greenland",)))
+    assert m.U[0] > 0
+    t = m.inv(m.tendency(np.zeros_like(m.q)))[0]
+    j = int(np.argmax(m.h.max(1)))
+    i = int(np.argmax(m.h[j]))
+    assert t[j, i - 2] < 0 < t[j, i + 2]
+    d = m.tendency(np.zeros_like(m.q)) - flat.tendency(np.zeros_like(flat.q))
+    assert np.allclose(d[1:], 0) and np.abs(d[0]).max() > 0

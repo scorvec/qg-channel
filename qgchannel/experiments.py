@@ -20,6 +20,7 @@ NUDGE_BASE = 12.5e3  # m: the nudging switches on over ~1 km around this height
 NUDGE_TAU = DAY
 FOLD_LAYER = 9.0e3  # m: wave breaking is counted on the layer nearest this height
 DAILY = ("u", "uv", "h0", "anti", "cyc")
+MAP_LEVELS = (0.5e3, 5.5e3)  # m: the lowest layer (surface pressure) and ~500 hPa
 
 
 def control(
@@ -30,13 +31,16 @@ def control(
     seed: int = 1,
     log: Callable[[str], None] = print,
 ) -> tuple[dict, np.ndarray]:
-    """Spin up from rest plus noise and run on. Returns daily zonal means after the spin-up {u, uv, vb, eke} (t, nz, ny)
-    and the model state every `every` days (restart points)."""
+    """Spin up from rest plus noise and run on. Returns daily zonal means after the spin-up {u, uv, vb, eke} (t, nz, ny),
+    the time-mean streamfunction near the ground and at ~5.5 km (psi_mean (2, ny, nx): the stationary waves), and the model
+    state every `every` days (restart points)."""
     m = build(c)
     rng = np.random.default_rng(seed)
     m.q = m.invert_q(m.psi_eq) + m.fwd(1e-7 * rng.standard_normal((m.c.nz, m.c.ny, m.c.nx))) * m.mask[None]
     out = {k: [] for k in ("u", "uv", "vb", "eke")}
     snaps = []
+    lev = [int(np.argmin(np.abs(m.z - zz))) for zz in MAP_LEVELS]
+    psum = np.zeros((len(lev), m.c.ny, m.c.nx))
     t0 = time.perf_counter()
     for d in range(days):
         m.run_days(1)
@@ -49,9 +53,16 @@ def control(
         s = zonal_stats(m)
         for k in out:
             out[k].append(s[k])
+        psum += m.inv(m.invert_psi(m.q))[lev]
         if d % 200 == 0:
             log(f"control day {d} ({time.perf_counter() - t0:.0f} s)")
-    return {k: np.array(v, np.float32) for k, v in out.items()} | {"z": m.z, "y": m.y}, np.array(snaps)
+    psi_mean = (psum / (days - spin)).astype(np.float32)
+    return {k: np.array(v, np.float32) for k, v in out.items()} | {
+        "z": m.z,
+        "y": m.y,
+        "h": m.h,
+        "psi_mean": psi_mean,
+    }, np.array(snaps)
 
 
 def ramp(z: np.ndarray, lo: float, hi: float) -> np.ndarray:
@@ -91,37 +102,43 @@ def imposed(
     anomaly: np.ndarray,
     days: int = 90,
     eddies: bool = True,
+    maps: bool = False,
     log: Callable[[str], None] = print,
 ) -> dict:
     """Runs from each restart with the stratosphere nudged toward clim + anomaly, in m/s: clim (nz, ny), anomaly either
-    fixed (nz, ny) or one per day (days, nz, ny). Returns daily {u, uv (nz, ny); h0, anti, cyc (ny,)} stacked as
-    (member, day, ...), NaN from the day a member blows up."""
+        fixed (nz, ny) or one per day (days, nz, ny). Returns daily {u, uv (nz, ny); h0, anti, cyc (ny,)} stacked as
+        (member, day, ...), NaN from the day a member blows up. maps=True adds the daily streamfunction near the ground and at
+    ~5.5 km, psi_maps (member, day, 2, ny, nx)."""
     m = build(c)
     rate = 0.5 * (1 + np.tanh((m.z - NUDGE_BASE) / 1000.0)) / NUDGE_TAU
     iz = int(np.argmin(np.abs(m.z - FOLD_LAYER)))
     anomaly = np.asarray(anomaly)
     targets = [target(m, clim + a) for a in (anomaly if anomaly.ndim == 3 else anomaly[None])]
-    out = {k: [] for k in DAILY}
+    keys = (*DAILY, "psi_maps") if maps else DAILY
+    lev = [int(np.argmin(np.abs(m.z - zz))) for zz in MAP_LEVELS]
+    out = {k: [] for k in keys}
     t0 = time.perf_counter()
     for k, q0 in enumerate(restarts):
         m.restart(q0)
         m.eddies = eddies
-        rec = {kk: [] for kk in DAILY}
+        rec = {kk: [] for kk in keys}
         for d in range(days):
             m.nudge = (targets[min(d, len(targets) - 1)], rate)
             m.run_days(1)
             if not np.isfinite(m.q).all():
-                for kk in DAILY:
+                for kk in keys:
                     rec[kk] += [np.full_like(rec[kk][0], np.nan)] * (days - d)
                 break
             s = zonal_stats(m)
             an, cy = folds(m, iz)
             for kk, v in (("u", s["u"]), ("uv", s["uv"]), ("h0", s["h0"]), ("anti", an), ("cyc", cy)):
                 rec[kk].append(v)
-        for kk in DAILY:
+            if maps:
+                rec["psi_maps"].append(m.inv(m.invert_psi(m.q))[lev])
+        for kk in keys:
             out[kk].append(np.array(rec[kk], np.float32))
         log(f"member {k} done ({time.perf_counter() - t0:.0f} s)")
-    return {k: np.array(v) for k, v in out.items()} | {"z": m.z, "y": m.y, "fold_layer": iz}
+    return {k: np.array(v) for k, v in out.items()} | {"z": m.z, "y": m.y, "fold_layer": iz, "h": m.h}
 
 
 def to_channel(

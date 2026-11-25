@@ -1,10 +1,10 @@
 """Impose an observed stratosphere: daily zonal-mean wind anomalies from a reanalysis, nudged above ~12.5 km.
 
-    python scripts/run_event.py ANOMALY.nc NAME [--members 50] [--dt 600] [--out runs]
+    python scripts/run_event.py ANOMALY.nc NAME [--members 50] [--dt 600] [--mountains greenland,rockies] [--out runs]
 ANOMALY.nc holds one variable u (time, lev, lat): the zonal-mean zonal-wind anomaly in m/s, pressure levels in hPa, northern
 latitudes, one value per day for the days to run (e.g. 10 days before an SSW's central date to 79 days after). It is
 mapped onto the channel with z = 7 km x ln(1000 / p) and y = (latitude - 9) x 111.2 km. Pair the result with `ref` run at
-the same --dt.
+the same --dt (and the same mountains, which also save daily maps).
 """
 
 from __future__ import annotations
@@ -25,15 +25,18 @@ def main() -> int:
     ap.add_argument("name")
     ap.add_argument("--members", type=int, default=50)
     ap.add_argument("--dt", type=float, default=600.0)
+    ap.add_argument("--mountains", default="", help="comma-separated: greenland, rockies (default: flat)")
+    ap.add_argument("--mountain-scale", type=float, default=qg.Config.mountain_scale)
     ap.add_argument("--out", type=Path, default=Path("runs"))
     a = ap.parse_args()
-    c = replace(qg.Config(), dt=a.dt)
+    mountains = tuple(x for x in a.mountains.split(",") if x)
+    c = replace(qg.Config(), dt=a.dt, mountains=mountains, mountain_scale=a.mountain_scale)
     m = qg.build(c)
     da = xr.open_dataarray(a.anomaly).transpose("time", "lev", "lat")
     du = qg.to_channel(m, da.values, da.lev.values, da.lat.values)
     clim = np.load(a.out / "control.npz")["u"].mean(0)
     restarts = np.load(a.out / "restarts.npy")[: a.members]
-    res = qg.imposed(c, restarts, clim, du, days=du.shape[0])
+    res = qg.imposed(c, restarts, clim, du, days=du.shape[0], maps=bool(mountains))
     np.savez(a.out / f"event_{a.name}.npz", imposed=du.astype(np.float32), **res)
     return 0
 

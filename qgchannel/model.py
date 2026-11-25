@@ -17,6 +17,11 @@ Forcing and damping: Newtonian cooling of the temperature (b = f0 psi_z) toward 
 rate alpha(z); Rayleigh friction on the vorticity in the lowest 2 km; a sponge under the lid; damping zones along both
 walls; an exact scale-selective hyperdiffusion. Time stepping: third-order Adams-Bashforth, 2/3-rule dealiasing.
 
+Mountains (`Config.mountains`) enter through the ground boundary condition: the ground temperature plus N^2 h is
+conserved, which adds f0 h / dz (per unit density at the ground) to the PV advected in the lowest layer. QG needs that
+term to stay well below f0, so with 2 km layers the plateaus are scaled down (`mountain_scale`): a 3 km Greenland becomes
+about 1 km, roughly the depth U/N of the air that goes over it rather than around.
+
 Optionally the zonal mean (k = 0) can be nudged toward a target state at a rate that varies with height
 (`Channel.nudge`): that imposes a stratosphere while leaving the troposphere and every eddy free.
 """
@@ -29,6 +34,13 @@ import numpy as np
 import scipy.fft as sf
 
 DAY = 86400.0
+
+# mountains: (x as a fraction of the circle, y (m), height (m), Gaussian half-widths in x and y (m)). x is the
+# longitude fraction measured from 180W; y = (latitude - 9) x 111.2 km, as for the observed stratospheres.
+MOUNTAINS = {
+    "greenland": (138.0 / 360.0, 7.0e6, 3000.0, 6.0e5, 8.0e5),  # 42W, 72N
+    "rockies": (70.0 / 360.0, 4.0e6, 2000.0, 5.0e5, 1.2e6),  # 110W, 45N
+}
 
 
 @dataclass
@@ -54,6 +66,8 @@ class Config:
     u_jet: float = 30.0  # equilibrium jet at the tropopause (sets the heating contrast)
     wall_width: float = 7.0e5  # damping zones along both walls keep momentum from piling up there
     wall_rate: float = 1.0 / DAY
+    mountains: tuple[str, ...] = ()  # names in MOUNTAINS
+    mountain_scale: float = 0.35  # QG limit: see the module docstring
 
 
 class Channel:
@@ -86,6 +100,12 @@ class Channel:
         self.Qy = c.beta - self.S @ U
         self.psi_eq = self.fwd(np.repeat(psi_eq_grid[:, :, None], nx, axis=2))
         self.q_eq = self.invert_q(self.psi_eq)
+        # mountains: the ground boundary term in the lowest layer's PV, and its gradient
+        self.h = self.topography()
+        self.qtopo_x = self.qtopo_y = None
+        if self.h.any():
+            qt = self.fwd(np.repeat((c.f0 * self.h / (self.dz * self.rho[0]))[None], nz, axis=0))[:1]
+            self.qtopo_x, self.qtopo_y = self.inv_dx(qt)[0], self.inv_dy(qt)[0]
         # damping
         self.r = c.r_sfc * np.clip(1 - self.z / c.z_fric, 0, 1)
         self.sponge = c.sponge_rate * np.clip((self.z - c.sponge_z) / (c.ztop - c.sponge_z), 0, 1) ** 2
@@ -99,6 +119,16 @@ class Channel:
         self.t = 0.0
         self.nudge: tuple[np.ndarray, np.ndarray] | None = None  # (target psi, spectral; rate (nz,) in 1/s)
         self.eddies = True  # False zeroes every eddy after each step (the storms-off experiment)
+
+    def topography(self) -> np.ndarray:
+        """Ground height (ny, nx) in m, from the named mountains."""
+        c = self.c
+        h = np.zeros((c.ny, c.nx))
+        for name in c.mountains:
+            x0, y0, top, wx, wy = MOUNTAINS[name]
+            dx = (self.x - x0 * c.Lx + 0.5 * c.Lx) % c.Lx - 0.5 * c.Lx
+            h += top * np.exp(-((dx[None, :] / wx) ** 2) - (((self.y - y0) / wy) ** 2)[:, None])
+        return c.mountain_scale * h
 
     def n2_profile(self, z: np.ndarray) -> np.ndarray:
         c = self.c
@@ -148,7 +178,10 @@ class Channel:
         ph = self.invert_psi(qh)
         u = -self.inv_dy(ph) + self.U[:, None, None]
         v = self.inv_dx(ph)
-        adv = self.fwd(u * self.inv_dx(qh) + v * (self.inv_dy(qh) + self.Qy[:, None, None]))
+        adv = u * self.inv_dx(qh) + v * (self.inv_dy(qh) + self.Qy[:, None, None])
+        if self.qtopo_x is not None:
+            adv[0] += u[0] * self.qtopo_x + v[0] * self.qtopo_y
+        adv = self.fwd(adv)
         F = -np.einsum("ij,jmk->imk", self.Sa, ph - self.psi_eq)
         F += self.r[:, None, None] * self.K2[None] * ph
         F -= self.sponge[:, None, None] * (qh - self.q_eq)
