@@ -2,6 +2,8 @@
 
     python observations/ifs_case.py control --run 2026-11-25T00 --start 2026-11-01 --elias DIR --archive DIR --out c.npz
     python observations/ifs_case.py members --run 2026-11-25T00 --members 1-10 --elias DIR --out m01.npz
+    python observations/ifs_case.py hindcast --runs 2026-10-01T00,2026-10-03T00 --members 1-25 --elias DIR --out h.npz
+    python observations/ifs_case.py analyses --start 2026-10-01 --end 2026-11-25 --elias DIR --out a.npz
 
 Data come from ECMWF's open-data copy on Google Cloud only (storage.googleapis.com/ecmwf-open-data; CC BY 4.0): each
 message is read by its byte range from the cycle's index. `control`: the step-0 analyses of every 00 and 12 UTC cycle
@@ -9,6 +11,7 @@ from --start to the run, then the run's own forecast to 360 h, all at 12 h, thro
 era5_wcb.py does for ERA5; adds the 500 hPa height and sea-level pressure on the networks' 1 degree grid and the zonal
 means of u, T and height on all 14 levels. `members`: the same fields (no networks) for each perturbed member at
 12-hourly steps, with the 300 hPa PV and its advection by the irrotational wind (the outflow's push on the tropopause).
+`hindcast` and `analyses`: earlier IFS-ENS cycles and the verifying analyses, daily, on coarse grids (coarse()).
 """
 
 from __future__ import annotations
@@ -144,68 +147,155 @@ def control(a, E) -> dict:
     return out
 
 
-def members(a, E) -> dict:
-    """Per member and 12-hourly step: Z500, MSLP, precipitation since the start (mm), zonal means, and the 300 hPa PV
-    and its advection by the irrotational wind."""
-    run = pd.Timestamp(a.run)
-    lo, hi = (int(x) for x in a.members.split("-"))
-    nums = list(range(lo, hi + 1))
-    steps = list(range(0, a.last_step + 1, 12))
-    need = {"u": LEVELS, "v": tuple(sorted({300, *W.PV_LEVS})), "t": LEVELS, "gh": LEVELS, "msl": (), "tp": ()}
+def state(raw: dict, E) -> dict:
+    """One member's or analysis' fields: extras() plus the 300 hPa PV and its advection by the irrotational wind
+    (PVU/day), u at 250 hPa and precipitation since the start (mm), on the networks' 1 degree grid."""
     lat = np.linspace(90.0, -90.0, 721)
     rows = E.ROWS.size
     north = 4 * (rows - 1) + 3
     metre = E.R_EARTH * np.pi / 180.0
     cos = np.cos(np.deg2rad(E.LAT))[:, None]
+    x = extras(raw, E)
+    fp = {
+        k: {
+            lev: W.box_mean(raw[k][1][raw[k][0].index(lev)].astype(np.float64)[:north], rows, E.LON.size)
+            for lev in W.PV_LEVS
+        }
+        for k in ("u", "v", "t")
+    }
+    u3, v3 = (raw[k][1][raw[k][0].index(300)].astype(np.float64) for k in ("u", "v"))
+    wind = E.irrotational_wind(W.divergence(u3, v3, lat)[:-1])
+    pv = W.potential_vorticity(fp, E)
+    adv = -86400.0 * (wind[0] * W.ddx(pv, metre, cos) + wind[1] * np.gradient(pv, axis=-2) / metre)
+    tp = raw["tp"][1][0] * 1000.0 if "tp" in raw else np.zeros((721, 1440))
+    u250 = fp["u"][250][1:-1]
+    x.update(
+        pv300=pv.astype(np.float32),
+        adv300=adv.astype(np.float32),
+        u250=u250.astype(np.float32),
+        tp=W.box_mean(tp[:north], rows, E.LON.size)[1:-1].astype(np.float32),
+        gh500=raw["gh"][1][raw["gh"][0].index(500)],
+    )
+    return x
+
+
+NEED = {"u": LEVELS, "v": tuple(sorted({300, *W.PV_LEVS})), "t": LEVELS, "gh": LEVELS, "msl": (), "tp": ()}
+FINE = ("z500", "msl", "zm_u", "zm_t", "zm_gh", "pv300", "adv300", "tp")
+
+
+def members(a, E) -> dict:
+    """Per member and 12-hourly step: the state() fields on 1 degree."""
+    run = pd.Timestamp(a.run)
+    lo, hi = (int(x) for x in a.members.split("-"))
+    nums = list(range(lo, hi + 1))
+    steps = list(range(0, a.last_step + 1, 12))
     pool = ThreadPoolExecutor(16)
-    keys = ("z500", "msl", "zm_u", "zm_t", "zm_gh", "pv300", "adv300", "tp")
-    res = {k: [] for k in keys}
+    res = {k: [] for k in FINE}
     for n in nums:
-        per = {k: [] for k in keys}
+        per = {k: [] for k in FINE}
         for step in steps:
             t0 = time.time()
-            nd = dict(need) if step else {k: v for k, v in need.items() if k != "tp"}
-            raw = read(run, step, "enfo", "ef", nd, number=str(n), pool=pool)
-            x = extras(raw, E)
-            fp = {
-                k: {
-                    lev: W.box_mean(raw[k][1][raw[k][0].index(lev)].astype(np.float64)[:north], rows, E.LON.size)
-                    for lev in W.PV_LEVS
-                }
-                for k in ("u", "v", "t")
-            }
-            u3, v3 = (raw[k][1][raw[k][0].index(300)].astype(np.float64) for k in ("u", "v"))
-            wind = E.irrotational_wind(W.divergence(u3, v3, lat)[:-1])
-            pv = W.potential_vorticity(fp, E)
-            adv = -86400.0 * (wind[0] * W.ddx(pv, metre, cos) + wind[1] * np.gradient(pv, axis=-2) / metre)
-            tp = raw["tp"][1][0] * 1000.0 if step else np.zeros((721, 1440))
-            x.update(
-                pv300=pv.astype(np.float16),
-                adv300=adv.astype(np.float16),
-                tp=W.box_mean(tp[:north], rows, E.LON.size)[1:-1].astype(np.float32),
-            )
-            for k in keys:
-                per[k].append(x[k])
+            nd = dict(NEED) if step else {k: v for k, v in NEED.items() if k != "tp"}
+            x = state(read(run, step, "enfo", "ef", nd, number=str(n), pool=pool), E)
+            for k in FINE:
+                per[k].append(x[k].astype(np.float16) if k in ("pv300", "adv300") else x[k])
             print(f"  member {n} +{step} h in {time.time() - t0:.0f} s", flush=True)
-        for k in keys:
+        for k in FINE:
             res[k].append(np.stack(per[k]))
     return dict(
         run=np.datetime64(run, "s"),
         numbers=np.array(nums),
         steps=np.array(steps),
         levels=np.array(LEVELS),
-        zlat=lat,
+        zlat=np.linspace(90.0, -90.0, 721),
         lat=E.LAT,
         lon=E.LON,
         **{k: np.stack(v) for k, v in res.items()},
     )
 
 
+COARSE = ("z500", "msl", "tp", "u250", "pv300", "adv300", "zm_u", "zm_gh")
+
+
+def coarse(x: dict) -> dict:
+    """Small copies for verification: Z500 on 2.5 degrees (from 0.25 degree, 20-90N, from 0E), the 1 degree fields
+    on 5 degrees (22-87N, from 178W), zonal means every 2 degrees (20-90N)."""
+    g = x["gh500"][1:281].reshape(28, 10, 144, 10).mean((1, 3))
+    out = {"z500": g.astype(np.float32)}
+    for k in ("msl", "tp", "u250", "pv300", "adv300"):
+        f = x[k][26:96]  # E.LAT 20..89
+        out[k] = (
+            f.reshape(14, 5, 72, 5).mean((1, 3)).astype(np.float16 if k in ("pv300", "adv300", "tp") else np.float32)
+        )
+    out["zm_u"] = x["zm_u"][:, 0:281:8].astype(np.float32)
+    out["zm_gh"] = x["zm_gh"][:, 0:281:8].astype(np.float32)
+    return out
+
+
+def coarse_coords() -> dict:
+    return dict(
+        lat25=88.625 - 2.5 * np.arange(28),
+        lon25=1.125 + 2.5 * np.arange(144),
+        lat5=22.0 + 5.0 * np.arange(14),
+        lon5=-178.0 + 5.0 * np.arange(72),
+        zlat2=90.0 - 2.0 * np.arange(36),
+        levels=np.array(LEVELS),
+    )
+
+
+def hindcast(a, E) -> dict:
+    """Earlier IFS-ENS cycles (--runs, comma separated) for members --members, daily steps to --last-step: coarse()."""
+    runs = [pd.Timestamp(r) for r in a.runs.split(",")]
+    lo, hi = (int(x) for x in a.members.split("-"))
+    nums = list(range(lo, hi + 1))
+    steps = list(range(0, a.last_step + 1, 24))
+    pool = ThreadPoolExecutor(16)
+    res = {k: [] for k in COARSE}
+    for run in runs:
+        per_run = {k: [] for k in COARSE}
+        for n in nums:
+            per = {k: [] for k in COARSE}
+            t0 = time.time()
+            for step in steps:
+                nd = dict(NEED) if step else {k: v for k, v in NEED.items() if k != "tp"}
+                x = coarse(state(read(run, step, "enfo", "ef", nd, number=str(n), pool=pool), E))
+                for k in COARSE:
+                    per[k].append(x[k])
+            print(f"  {run:%Y-%m-%d %H}Z member {n}: {len(steps)} steps in {time.time() - t0:.0f} s", flush=True)
+            for k in COARSE:
+                per_run[k].append(np.stack(per[k]))
+        for k in COARSE:
+            res[k].append(np.stack(per_run[k]))
+    return dict(
+        runs=np.array([np.datetime64(r, "s") for r in runs]),
+        numbers=np.array(nums),
+        steps=np.array(steps),
+        **coarse_coords(),
+        **{k: np.stack(v) for k, v in res.items()},
+    )
+
+
+def analyses(a, E) -> dict:
+    """The step-0 analyses at 00 UTC from --start to --end: coarse()."""
+    days = pd.date_range(a.start, a.end, freq="1D")
+    pool = ThreadPoolExecutor(16)
+    need = {k: v for k, v in NEED.items() if k != "tp"}
+    res = {k: [] for k in COARSE}
+    for d in days:
+        x = coarse(state(read(d, 0, "oper", "fc", need, pool=pool), E))
+        for k in COARSE:
+            res[k].append(x[k])
+        print(f"  analysis {d:%Y-%m-%d}", flush=True)
+    return dict(days=days.values.astype("datetime64[s]"), **coarse_coords(), **{k: np.stack(v) for k, v in res.items()})
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=("control", "members"))
-    ap.add_argument("--run", required=True)
+    ap.add_argument("mode", choices=("control", "members", "hindcast", "analyses"))
+    ap.add_argument("--run", default="")
     ap.add_argument("--start")
+    ap.add_argument("--end")
+    ap.add_argument("--runs", default="")
     ap.add_argument("--members", default="1-50")
     ap.add_argument("--last-step", type=int, default=360)
     ap.add_argument("--elias", required=True)
@@ -215,7 +305,7 @@ def main() -> int:
     sys.path.insert(0, a.elias)
     import elias as E
 
-    out = control(a, E) if a.mode == "control" else members(a, E)
+    out = {"control": control, "members": members, "hindcast": hindcast, "analyses": analyses}[a.mode](a, E)
     np.savez_compressed(a.out, **out)
     print("wrote", a.out, {k: getattr(v, "shape", None) for k, v in out.items()})
     return 0
