@@ -92,34 +92,40 @@ def main() -> int:
     north = 4 * (E.ROWS.size - 1) + 3  # 90N to 7.5S
     root = Path(a.archive)
 
-    def one(t):
+    def fetch(t):
+        """Download only (threads): {name: (levels, 721, 1440)} with 300 hPa added for the winds."""
         for attempt in range(1, 5):
             try:
                 t0 = time.time()
-                f, wind = {}, None
+                raw = {}
                 for k, levels in E.LEVELS.items():
                     need = sorted(set(levels) | ({300} if k in "uv" else set()))
-                    x = ds[NAMES[k]].sel(time=t, level=need).values.astype(np.float64)  # (lev, 721, 1440)
-                    for i, lev in enumerate(need):
-                        if lev in levels:
-                            b = box_mean(x[i, :north], E.ROWS.size, E.LON.size).astype(np.float64)
-                            f.setdefault(k, {})[lev] = np.maximum(b, 0.0) if k == "q" else b
-                    if k in "uv":
-                        f.setdefault("_300", {})[k] = x[need.index(300)]
-                div = divergence(f["_300"]["u"], f["_300"]["v"], lat)[:-1]  # Driscoll-Healy: no south-pole row
-                del f["_300"]
-                wind = E.irrotational_wind(div)
+                    raw[k] = (need, ds[NAMES[k]].sel(time=t, level=need).values)
                 print(f"  {t:%Y-%m-%d %H}Z read in {time.time() - t0:.0f} s", flush=True)
-                return t, f, np.hypot(wind[0], wind[1]).astype(np.float32)
+                return raw
             except Exception as e:  # a transient read error must not end the event
                 print(f"  {t:%Y-%m-%d %H}Z attempt {attempt}: {type(e).__name__}: {str(e)[:120]}", flush=True)
                 time.sleep(15 * attempt)
         raise SystemExit(f"{t}: no data")
 
+    def reduce(raw):
+        """In the main thread (pyshtools is not thread-safe): the 1 degree fields and the outflow wind speed."""
+        f = {}
+        for k, (need, x) in raw.items():
+            for i, lev in enumerate(need):
+                if lev in E.LEVELS[k]:
+                    b = box_mean(x[i, :north].astype(np.float64), E.ROWS.size, E.LON.size).astype(np.float64)
+                    f.setdefault(k, {})[lev] = np.maximum(b, 0.0) if k == "q" else b
+        u, v = (raw[k][1][raw[k][0].index(300)].astype(np.float64) for k in ("u", "v"))
+        wind = E.irrotational_wind(divergence(u, v, lat)[:-1])  # Driscoll-Healy: no south-pole row
+        return f, np.hypot(wind[0], wind[1]).astype(np.float32)
+
+    got = []
     with ThreadPoolExecutor(a.workers) as pool:
-        got = list(pool.map(one, times))
-    fields = {k: {lev: np.stack([g[1][k][lev] for g in got]) for lev in E.LEVELS[k]} for k in E.LEVELS}
-    speed = np.stack([g[2] for g in got])
+        for i in range(0, len(times), a.workers):  # bounded: a batch of raw fields in memory at a time
+            got.extend(reduce(raw) for raw in pool.map(fetch, times[i : i + a.workers]))
+    fields = {k: {lev: np.stack([g[0][k][lev] for g in got]) for lev in E.LEVELS[k]} for k in E.LEVELS}
+    speed = np.stack([g[1] for g in got])
     del got
     nets = {s: E.Net(root / "models" / f"cnn_{E.STAGES[s]}.h5") for s in E.STAGES}
     days = [t.normalize() for t in times]

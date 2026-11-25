@@ -77,7 +77,7 @@ jobs:
           mkdir archive && unzip -q wcbmetric_v2.zip -d archive
           root=$(dirname "$(find archive -name calc_wcbmetric_v2.py | head -1)")
           tag=$(echo "$DATE" | tr -d -)
-          python -u observations/era5_wcb.py --date "$DATE" --elias site/scripts/wcb --archive "$root" \
+          python -u -X faulthandler observations/era5_wcb.py --date "$DATE" --elias site/scripts/wcb --archive "$root" \
             --out "wcb_${tag}.npz" 2>&1 | tee "wcb_${tag}.log"
       - uses: actions/upload-artifact@v4
         with:
