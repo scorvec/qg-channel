@@ -123,7 +123,6 @@ def main() -> int:
     lat = ds.latitude.values
     if lat[0] != 90.0 or lat[1] != 89.75 or ds.longitude.values[0] != 0.0:
         raise SystemExit("unexpected grid")
-    north = 4 * (E.ROWS.size - 1) + 3  # 90N to 7.5S
     root = Path(a.archive)
 
     def fetch(t):
@@ -142,11 +141,23 @@ def main() -> int:
                 time.sleep(15 * attempt)
         raise SystemExit(f"{t}: no data")
 
+    np.savez_compressed(a.out, **identify(times, fetch, E, root, lat, a.workers))
+    return 0
+
+
+def identify(times, fetch, E, root: Path, lat: np.ndarray, workers: int, extra=None) -> dict:
+    """The stages at `times` (12-hourly) from fetch(t) -> {name: (levels, 0.25 degree array from 90N and 0E)}, read in
+    threads and reduced in the main thread (pyshtools is not thread-safe). extra(raw) -> {name: array} adds per-time
+    fields to the output. Returns the arrays to save (times without the first and last LAG_H)."""
+    north = 4 * (E.ROWS.size - 1) + 3  # 90N to 7.5S
+
     def reduce(raw):
-        """In the main thread (pyshtools is not thread-safe): the 1 degree fields, the outflow wind speed, the 300 hPa
-        PV and the rate (PVU/day) at which the irrotational wind advects it (the outflow's push on the tropopause)."""
+        """The 1 degree fields, the outflow wind speed, the 300 hPa PV and the rate (PVU/day) at which the
+        irrotational wind advects it (the outflow's push on the tropopause)."""
         f, fp = {}, {}
         for k, (need, x) in raw.items():
+            if k not in E.LEVELS:
+                continue
             for i, lev in enumerate(need):
                 if lev in E.LEVELS[k] or lev in PV_LEVS:
                     b = box_mean(x[i, :north].astype(np.float64), E.ROWS.size, E.LON.size).astype(np.float64)
@@ -160,16 +171,18 @@ def main() -> int:
         metre = E.R_EARTH * np.pi / 180.0
         cos = np.cos(np.deg2rad(E.LAT))[:, None]
         adv = -86400.0 * (wind[0] * ddx(pv, metre, cos) + wind[1] * np.gradient(pv, axis=-2) / metre)
-        return f, np.hypot(wind[0], wind[1]).astype(np.float32), pv.astype(np.float32), adv.astype(np.float32)
+        more = extra(raw) if extra else {}
+        return f, np.hypot(wind[0], wind[1]).astype(np.float32), pv.astype(np.float32), adv.astype(np.float32), more
 
     got = []
-    with ThreadPoolExecutor(a.workers) as pool:
-        for i in range(0, len(times), a.workers):  # bounded: a batch of raw fields in memory at a time
-            got.extend(reduce(raw) for raw in pool.map(fetch, times[i : i + a.workers]))
+    with ThreadPoolExecutor(workers) as pool:
+        for i in range(0, len(times), workers):  # bounded: a batch of raw fields in memory at a time
+            got.extend(reduce(raw) for raw in pool.map(fetch, times[i : i + workers]))
     fields = {k: {lev: np.stack([g[0][k][lev] for g in got]) for lev in E.LEVELS[k]} for k in E.LEVELS}
     speed = np.stack([g[1] for g in got])
     pv300 = np.stack([g[2] for g in got])
     adv300 = np.stack([g[3] for g in got])
+    more = {k: np.stack([g[4][k] for g in got]) for k in got[0][4]}
     del got
     nets = {s: E.Net(root / "models" / f"cnn_{E.STAGES[s]}.h5") for s in E.STAGES}
     days = [t.normalize() for t in times]
@@ -188,8 +201,8 @@ def main() -> int:
     foot = np.stack([np.stack([prob[s][i] > E.thresholds(root, s, kt[i]) for i in range(len(kt))]) for s in stages])
     udays = pd.DatetimeIndex(sorted({t.normalize() for t in kt}))
     clim = np.stack([np.stack([E.climatology(root, s, cal_day(d)) for d in udays]) for s in stages]).astype(np.float16)
-    np.savez_compressed(
-        a.out,
+    print(f"{len(kt)} times; mean shares", {s: round(float(foot[i].mean()), 4) for i, s in enumerate(stages)})
+    return dict(
         times=kt.values.astype("datetime64[s]"),
         days=udays.values.astype("datetime64[D]"),
         foot=np.packbits(foot.reshape(len(stages), len(kt), -1), axis=-1),
@@ -199,12 +212,8 @@ def main() -> int:
         stages=np.array(stages),
         pv300=pv300[keep].astype(np.float16),
         adv300=adv300[keep].astype(np.float16),
+        **{k: v[keep] for k, v in more.items()},
     )
-    print(
-        f"wrote {a.out}: {len(kt)} times; mean shares",
-        {s: round(float(foot[i].mean()), 4) for i, s in enumerate(stages)},
-    )
-    return 0
 
 
 if __name__ == "__main__":

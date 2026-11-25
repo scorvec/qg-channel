@@ -1,0 +1,127 @@
+name: ifs-case
+
+# One forecast case from ECMWF open data (Google Cloud copy only; observations/ifs_case.py): the IFS control with the
+# analyses before it, through the ELIAS 2.0 networks (elias.py from scorvec/scorvec.github.io and that repository's
+# release wcb-ref-v1), and every IFS-ENS member's fields in ten jobs of five. Results: this repository's release
+# ifs-case-<run>.
+on:
+  workflow_dispatch:
+    inputs:
+      run:
+        description: "cycle, YYYY-MM-DDTHH (00 or 12 UTC)"
+        required: true
+      start:
+        description: "first analysis, YYYY-MM-DD (control)"
+        required: true
+      last_step:
+        description: "last forecast step (h)"
+        default: "360"
+      members:
+        description: "run the IFS-ENS members too"
+        type: boolean
+        default: true
+
+jobs:
+  control:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: scorvec/scorvec.github.io
+          path: site
+          sparse-checkout: scripts/wcb
+          sparse-checkout-cone-mode: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -e ".[wcb]" eccodes
+      - uses: actions/cache@v4
+        id: arch
+        with:
+          path: wcbmetric_v2.zip
+          key: wcb-ref-v1-dbea2b2f3d836fb3190b3ca2b2e0c0bc
+      - name: The networks, thresholds and climatology (scorvec.github.io release wcb-ref-v1)
+        if: steps.arch.outputs.cache-hit != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release download wcb-ref-v1 -R scorvec/scorvec.github.io -p wcbmetric_v2.zip
+      - name: Control and analyses
+        env:
+          RUN: ${{ inputs.run }}
+          START: ${{ inputs.start }}
+          LAST: ${{ inputs.last_step }}
+        run: |
+          set -o pipefail
+          echo "dbea2b2f3d836fb3190b3ca2b2e0c0bc  wcbmetric_v2.zip" | md5sum -c -
+          mkdir archive && unzip -q wcbmetric_v2.zip -d archive
+          root=$(dirname "$(find archive -name calc_wcbmetric_v2.py | head -1)")
+          python -u -X faulthandler observations/ifs_case.py control --run "$RUN" --start "$START" --last-step "$LAST" \
+            --elias site/scripts/wcb --archive "$root" --out control.npz 2>&1 | tee control.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: control
+          path: |
+            control.npz
+            control.log
+
+  members:
+    if: inputs.members
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      max-parallel: 10
+      matrix:
+        shard: ["1-5", "6-10", "11-15", "16-20", "21-25", "26-30", "31-35", "36-40", "41-45", "46-50"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: scorvec/scorvec.github.io
+          path: site
+          sparse-checkout: scripts/wcb
+          sparse-checkout-cone-mode: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -e ".[wcb]" eccodes
+      - name: Members
+        env:
+          RUN: ${{ inputs.run }}
+          LAST: ${{ inputs.last_step }}
+          SHARD: ${{ matrix.shard }}
+        run: |
+          set -o pipefail
+          python -u -X faulthandler observations/ifs_case.py members --run "$RUN" --members "$SHARD" \
+            --last-step "$LAST" --elias site/scripts/wcb --out "members_${SHARD}.npz" 2>&1 | tee "members_${SHARD}.log"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: members-${{ matrix.shard }}
+          path: members_*
+
+  publish:
+    needs: [control, members]
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: out
+          merge-multiple: true
+      - name: Release ifs-case-<run>
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN: ${{ inputs.run }}
+        run: |
+          if ! ls out/*.npz >/dev/null 2>&1; then echo "::warning::nothing finished"; exit 0; fi
+          tag="ifs-case-$(echo "$RUN" | tr -d 'T:-')"
+          gh release view "$tag" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
+            gh release create "$tag" -R "$GITHUB_REPOSITORY" --title "$tag" \
+              --notes "ECMWF open data (CC BY 4.0), IFS control and IFS-ENS, cycle $RUN; observations/ifs_case.py."
+          gh release upload "$tag" -R "$GITHUB_REPOSITORY" out/*.npz out/*.log --clobber
