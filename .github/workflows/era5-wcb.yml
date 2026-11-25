@@ -99,7 +99,7 @@ jobs:
       - env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          ls out
+          if ! ls out/*.npz >/dev/null 2>&1; then echo "::warning::no event finished"; exit 0; fi
           gh release view era5-wcb-v1 >/dev/null 2>&1 || gh release create era5-wcb-v1 \
             --title "ERA5 warm conveyor belts around SSWs" \
             --notes "ELIAS 2.0 (Quinting and Grams 2022) on ERA5 at 00/12 UTC, event days -10 to +45; observations/era5_wcb.py."
