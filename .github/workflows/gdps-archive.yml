@@ -9,6 +9,9 @@ on:
       cycles:
         description: "00 UTC cycles, YYYYMMDD space separated"
         required: true
+      steps:
+        description: "which files: 000 (00 UTC analysis) and/or 006 (12 UTC + 6 h)"
+        default: "000 006"
 
 jobs:
   fetch:
@@ -21,15 +24,18 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           CYCLES: ${{ inputs.cycles }}
+          STEPS: ${{ inputs.steps }}
         run: |
           set -euo pipefail
           H=https://hpfx.collab.science.gc.ca
           LEV="0050 0100 0150 0200 0250 0300 0400 0500 0600 0700 0850 0925 1000"
-          names() {
+          names() {  # $1 = step; the 6 h forecasts carry no SST, land fraction or sea ice
             for v in AirTemp GeopotentialHeight WindU WindV SpecificHumidity; do for l in $LEV; do echo "${v}_IsbL-$l"; done; done
             for l in 0200 0250 0500 0600 0700 0850; do echo "VerticalVelocity_IsbL-$l"; done
             for n in AirTemp_AGL-2m Pressure_MSL WindU_AGL-10m WindV_AGL-10m WindU_AGL-80m WindV_AGL-80m WindU_AGL-120m \
-                     WindV_AGL-120m SeaWaterTemp_Sfc LandWaterProportion_Sfc SeaIceFraction_Sfc; do echo "$n"; done
+                     WindV_AGL-120m; do echo "$n"; done
+            [ "$1" = 000 ] && for n in SeaWaterTemp_Sfc LandWaterProportion_Sfc SeaIceFraction_Sfc; do echo "$n"; done
+            return 0
           }
           gh release view gdps-analysis-v1 -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
             gh release create gdps-analysis-v1 -R "$GITHUB_REPOSITORY" --title gdps-analysis-v1 \
@@ -38,8 +44,9 @@ jobs:
             prev=$(date -u -d "$c - 1 day" +%Y%m%d)
             for spec in "$c 00 000" "$prev 12 006"; do
               set -- $spec; d=$1; hh=$2; st=$3
+              [[ " $STEPS " == *" $st "* ]] || continue
               out="gdps_${d}${hh}_f${st}.grib2"; : > "$out"; miss=0
-              for n in $(names); do
+              for n in $(names "$st"); do
                 f="${d}T${hh}Z_MSC_GDPS_${n}_LatLon0.15_PT${st}H.grib2"
                 if curl -sf --retry 4 -A "qg-channel-gdps-archive/0.1" "$H/$d/WXO-DD/model_gdps/15km/$hh/$st/$f" >> "$out"; then :; else
                   echo "::warning::missing $f"; miss=$((miss + 1)); fi
