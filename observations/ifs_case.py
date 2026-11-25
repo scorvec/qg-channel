@@ -345,12 +345,19 @@ def region_boxes(g: np.ndarray) -> dict:
 
 
 def region_state(raw: dict, acc: bool) -> dict:
+    """Fields missing from a cycle's files (open data added some, e.g. low cloud, in October 2026) are NaN."""
     out = {}
     for k in REGION_PL:
         out[k] = region_grid(raw[k][1].astype(np.float64))
     for k in REGION_SFC + (REGION_ACC if acc else ()):
-        out[k] = region_grid(raw[k][1][0].astype(np.float64)) if k in raw else np.zeros((20, 70))
+        out[k] = region_grid(raw[k][1][0].astype(np.float64)) if k in raw else np.full((20, 70), np.nan)
     return out
+
+
+def region_read(run, step, stream, kind, need, number=None, pool=None) -> dict:
+    """read() of the surface fields this cycle's files carry (pressure-level fields are required)."""
+    have = {r["param"] for r in index(run, step, stream, kind)}
+    return read(run, step, stream, kind, {k: v for k, v in need.items() if v or k in have}, number, pool)
 
 
 def region(a, E) -> dict:
@@ -377,9 +384,9 @@ def region(a, E) -> dict:
                 need = dict.fromkeys(REGION_PL, LEVELS) | dict.fromkeys(REGION_SFC, ())
                 if step:
                     need |= dict.fromkeys(REGION_ACC, ())
-                x = region_state(read(run, step, "enfo", "ef", need, number=str(n), pool=pool), acc=step > 0)
+                x = region_state(region_read(run, step, "enfo", "ef", need, number=str(n), pool=pool), acc=step > 0)
                 for k in keys:
-                    v = x.get(k, np.zeros((20, 70)))
+                    v = x.get(k, np.zeros((20, 70)))  # accumulations at step 0
                     s1[k][j] += v
                     s2[k][j] += v * v
                     for b, m in region_boxes(v).items():
@@ -410,7 +417,7 @@ def region_analyses(a, E) -> dict:
     need = dict.fromkeys(REGION_PL, LEVELS) | dict.fromkeys(REGION_SFC, ())
     res: dict[str, list] = {}
     for d in days:
-        x = region_state(read(d, 0, "oper", "fc", need, pool=pool), acc=False)
+        x = region_state(region_read(d, 0, "oper", "fc", need, pool=pool), acc=False)
         for k, v in x.items():
             res.setdefault(k, []).append(v.astype(np.float32))
             for b, m in region_boxes(v).items():
