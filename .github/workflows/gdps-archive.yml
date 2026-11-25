@@ -1,0 +1,51 @@
+name: gdps-archive
+
+# Keeps the Canadian GDPS analyses (00 UTC, step 0) and the 6 h forecasts from the 12 UTC run before them (stand-ins for
+# 18 UTC, which the GDPS does not run) from ECCC's HPFX copy of the MSC Datamart, which holds about 50 days: the fields
+# an ERA5-trained model starts from, one GRIB file per time in this repository's release gdps-analysis-v1.
+on:
+  workflow_dispatch:
+    inputs:
+      cycles:
+        description: "00 UTC cycles, YYYYMMDD space separated"
+        required: true
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: write
+    steps:
+      - name: Fetch and release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CYCLES: ${{ inputs.cycles }}
+        run: |
+          set -euo pipefail
+          H=https://hpfx.collab.science.gc.ca
+          LEV="0050 0100 0150 0200 0250 0300 0400 0500 0600 0700 0850 0925 1000"
+          names() {
+            for v in AirTemp GeopotentialHeight WindU WindV SpecificHumidity; do for l in $LEV; do echo "${v}_IsbL-$l"; done; done
+            for l in 0200 0250 0500 0600 0700 0850; do echo "VerticalVelocity_IsbL-$l"; done
+            for n in AirTemp_AGL-2m Pressure_MSL WindU_AGL-10m WindV_AGL-10m WindU_AGL-80m WindV_AGL-80m WindU_AGL-120m \
+                     WindV_AGL-120m SeaWaterTemp_Sfc LandWaterProportion_Sfc SeaIceFraction_Sfc; do echo "$n"; done
+          }
+          gh release view gdps-analysis-v1 -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
+            gh release create gdps-analysis-v1 -R "$GITHUB_REPOSITORY" --title gdps-analysis-v1 \
+              --notes "Environment and Climate Change Canada GDPS analyses and 6 h forecasts (MSC open data licence), as published on the MSC Datamart / HPFX."
+          for c in $CYCLES; do
+            prev=$(date -u -d "$c - 1 day" +%Y%m%d)
+            for spec in "$c 00 000" "$prev 12 006"; do
+              set -- $spec; d=$1; hh=$2; st=$3
+              out="gdps_${d}${hh}_f${st}.grib2"; : > "$out"; miss=0
+              for n in $(names); do
+                f="${d}T${hh}Z_MSC_GDPS_${n}_LatLon0.15_PT${st}H.grib2"
+                if curl -sf --retry 4 -A "qg-channel-gdps-archive/0.1" "$H/$d/WXO-DD/model_gdps/15km/$hh/$st/$f" >> "$out"; then :; else
+                  echo "::warning::missing $f"; miss=$((miss + 1)); fi
+              done
+              echo "$out $(du -h "$out" | cut -f1), $miss missing"
+              [ "$miss" -eq 0 ] && gh release upload gdps-analysis-v1 -R "$GITHUB_REPOSITORY" "$out" --clobber
+              rm -f "$out"
+            done
+          done
