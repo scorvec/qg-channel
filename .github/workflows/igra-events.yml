@@ -1,0 +1,37 @@
+name: igra-events
+
+# Polar-cap radiosonde anomalies around each sudden stratospheric warming, from the igra-arctic release; the two small
+# result tables are added to that release.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "release holding igra_arctic.parquet"
+        default: "igra-arctic-v1"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: igra
+  cancel-in-progress: false
+
+jobs:
+  events:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -e ".[observations]"
+      - name: Composite the soundings
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          mkdir -p igra
+          gh release download "$TAG" -p igra_arctic.parquet -p stations.csv -D igra
+          python observations/igra_events.py --igra igra
+          gh release upload "$TAG" igra/igra_event_daily.csv igra/igra_event_windows.csv --clobber
