@@ -1,4 +1,5 @@
-"""A forecast case from ECMWF open data: the IFS control (with its analyses before the run) or the IFS-ENS members.
+"""A forecast case from ECMWF open data: the IFS control (with its analyses before the run) or the IFS-ENS members;
+--model aifs-single / aifs-ens takes the forecast from the AIFS single run or the AIFS-ENS control and members instead.
 
     python observations/ifs_case.py control --run 2026-11-25T00 --start 2026-11-01 --elias DIR --archive DIR --out c.npz
     python observations/ifs_case.py members --run 2026-11-25T00 --members 1-10 --elias DIR --out m01.npz
@@ -33,10 +34,18 @@ import era5_wcb as W
 BASE = "https://storage.googleapis.com/ecmwf-open-data"
 UA = {"User-Agent": "qg-channel-ifs-case/0.1"}
 LEVELS = (10, 50, 100, 150, 200, 250, 300, 400, 500, 600, 700, 850, 925, 1000)
+# model -> (directory, control stream and file kind, members' file kind); the AIFS-ENS files carry geopotential z
+MODELS = {
+    "ifs": ("ifs", ("oper", "fc"), "ef"),
+    "aifs-single": ("aifs-single", ("oper", "fc"), None),
+    "aifs-ens": ("aifs-ens", ("enfo", "cf"), "pf"),
+}
+G = 9.80665
 
 
-def url(run: pd.Timestamp, step: int, stream: str, kind: str) -> str:
-    return f"{BASE}/{run:%Y%m%d}/{run:%H}z/ifs/0p25/{stream}/{run:%Y%m%d%H}0000-{step}h-{stream}-{kind}"
+def url(run: pd.Timestamp, step: int, stream: str, kind: str, model: str = "ifs") -> str:
+    d = MODELS[model][0]
+    return f"{BASE}/{run:%Y%m%d}/{run:%H}z/{d}/0p25/{stream}/{run:%Y%m%d%H}0000-{step}h-{stream}-{kind}"
 
 
 def get(u: str, rng: tuple[int, int] | None = None, tries: int = 5) -> bytes:
@@ -55,8 +64,10 @@ def get(u: str, rng: tuple[int, int] | None = None, tries: int = 5) -> bytes:
     raise RuntimeError(u)
 
 
-def index(run, step, stream, kind) -> list[dict]:
-    return [json.loads(x) for x in get(url(run, step, stream, kind) + ".index").decode().splitlines() if x.strip()]
+def index(run, step, stream, kind, model="ifs") -> list[dict]:
+    return [
+        json.loads(x) for x in get(url(run, step, stream, kind, model) + ".index").decode().splitlines() if x.strip()
+    ]
 
 
 def decode(buf: bytes) -> np.ndarray:
@@ -90,10 +101,18 @@ def want(rows: list[dict], need: dict[str, tuple], number: str | None) -> list[d
     return out
 
 
-def read(run, step, stream, kind, need, number=None, pool=None) -> dict:
-    """{param: (levels, array (levels, 721, 1440))}; surface fields have levels [0]."""
-    rows = want(index(run, step, stream, kind), need, number)
-    u = url(run, step, stream, kind) + ".grib2"
+def read(run, step, stream, kind, need, number=None, pool=None, model="ifs") -> dict:
+    """{param: (levels, array (levels, 721, 1440))}; surface fields have levels [0]. Files without geopotential
+    height (AIFS-ENS) give gh from z."""
+    rows = index(run, step, stream, kind, model)
+    if "gh" in need and not any(r["param"] == "gh" for r in rows):
+        out = read(
+            run, step, stream, kind, {("z" if k == "gh" else k): v for k, v in need.items()}, number, pool, model
+        )
+        levs, z = out.pop("z")
+        return {**out, "gh": (levs, z / G)}
+    rows = want(rows, need, number)
+    u = url(run, step, stream, kind, model) + ".grib2"
     bufs = list(pool.map(lambda r: get(u, (r["_offset"], r["_length"])), rows))
     got: dict[str, dict] = {}
     for r, b in zip(rows, bufs, strict=True):
@@ -134,8 +153,12 @@ def control(a, E) -> dict:
 
     def fetch(t):
         t0 = time.time()
-        cyc, step = (t, 0) if t <= run else (run, int((t - run) / pd.Timedelta(hours=1)))
-        raw = read(cyc, step, "oper", "fc", need, pool=pool)
+        if t <= run:
+            raw = read(t, 0, "oper", "fc", need, pool=pool)
+            step = 0
+        else:
+            step = int((t - run) / pd.Timedelta(hours=1))
+            raw = read(run, step, *MODELS[a.model][1], need, pool=pool, model=a.model)
         print(
             f"  {t:%Y-%m-%d %H}Z ({'analysis' if step == 0 else f'+{step} h'}) in {time.time() - t0:.0f} s", flush=True
         )
@@ -196,7 +219,7 @@ def members(a, E) -> dict:
         for step in steps:
             t0 = time.time()
             nd = dict(NEED) if step else {k: v for k, v in NEED.items() if k != "tp"}
-            x = state(read(run, step, "enfo", "ef", nd, number=str(n), pool=pool), E)
+            x = state(read(run, step, "enfo", MODELS[a.model][2], nd, number=str(n), pool=pool, model=a.model), E)
             for k in FINE:
                 per[k].append(x[k].astype(np.float16) if k in ("pv300", "adv300") else x[k])
             print(f"  member {n} +{step} h in {time.time() - t0:.0f} s", flush=True)
@@ -293,6 +316,7 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("mode", choices=("control", "members", "hindcast", "analyses"))
     ap.add_argument("--run", default="")
+    ap.add_argument("--model", choices=tuple(MODELS), default="ifs")
     ap.add_argument("--start")
     ap.add_argument("--end")
     ap.add_argument("--runs", default="")
